@@ -80,6 +80,11 @@ pub struct RustAnalyzer {
     workspace_root: RwLock<Option<PathBuf>>,
     type_cache: RwLock<HashMap<String, TypeInfo>>,
     type_aliases: RwLock<HashMap<String, String>>,
+    /// Types keyed by their crate-qualified path (e.g. `my_crate::models::User`),
+    /// so RON files outside a crate (or in another workspace member) can refer to them.
+    crate_types: RwLock<HashMap<String, TypeInfo>>,
+    /// Type aliases keyed by their crate-qualified path.
+    crate_type_aliases: RwLock<HashMap<String, String>>,
     initial_scan_complete: RwLock<bool>,
     custom_deserializers: RwLock<HashSet<String>>,
 }
@@ -90,6 +95,8 @@ impl RustAnalyzer {
             workspace_root: RwLock::new(None),
             type_cache: RwLock::new(HashMap::new()),
             type_aliases: RwLock::new(HashMap::new()),
+            crate_types: RwLock::new(HashMap::new()),
+            crate_type_aliases: RwLock::new(HashMap::new()),
             initial_scan_complete: RwLock::new(false),
             custom_deserializers: RwLock::new(HashSet::new()),
         }
@@ -114,8 +121,11 @@ impl RustAnalyzer {
 
         let mut type_cache = self.type_cache.write().await;
         let mut type_aliases = self.type_aliases.write().await;
+        let mut crate_types = self.crate_types.write().await;
+        let mut crate_type_aliases = self.crate_type_aliases.write().await;
 
         let mut custom_deserializers = HashSet::new();
+        let mut crate_names = HashMap::new();
 
         // Find all .rs files in the workspace
         for entry in WalkDir::new(&root)
@@ -131,12 +141,36 @@ impl RustAnalyzer {
                         &self.file_path_to_module_path(entry.path()),
                         &mut custom_deserializers,
                     );
+                    let mut file_types = HashMap::new();
+                    let mut file_aliases = HashMap::new();
                     self.extract_types_from_file(
                         &syntax_tree,
                         entry.path(),
-                        &mut type_cache,
-                        &mut type_aliases,
+                        &mut file_types,
+                        &mut file_aliases,
                     );
+
+                    // Also register `crate::...` paths under the owning crate's name,
+                    // e.g. `crate::user::User` -> `proj_core::user::User`.
+                    if let Some(crate_name) = find_crate_name(entry.path(), &root, &mut crate_names)
+                    {
+                        for (key, info) in &file_types {
+                            if let Some(qualified) = crate_qualified_path(key, &crate_name) {
+                                crate_types.insert(qualified, info.clone());
+                            }
+                        }
+                        for (key, target) in &file_aliases {
+                            if let Some(qualified) = crate_qualified_path(key, &crate_name) {
+                                // `type_to_string` renders paths as `crate :: a :: B`
+                                let target = target.replace(" :: ", "::");
+                                let target =
+                                    crate_qualified_path(&target, &crate_name).unwrap_or(target);
+                                crate_type_aliases.insert(qualified, target);
+                            }
+                        }
+                    }
+                    type_cache.extend(file_types);
+                    type_aliases.extend(file_aliases);
                 }
             }
         }
@@ -460,11 +494,25 @@ impl RustAnalyzer {
         // Resolve type aliases first
         let resolved_type = {
             let aliases = self.type_aliases.read().await;
-            aliases
-                .get(type_path)
-                .cloned()
-                .unwrap_or_else(|| type_path.to_string())
+            match aliases.get(type_path) {
+                Some(target) => target.clone(),
+                None => self
+                    .crate_type_aliases
+                    .read()
+                    .await
+                    .get(type_path)
+                    .cloned()
+                    .unwrap_or_else(|| type_path.to_string()),
+            }
         };
+
+        // Crate-qualified paths (e.g. `my_crate::models::User`)
+        if let Some(info) = self
+            .get_crate_qualified_type(type_path, &resolved_type)
+            .await
+        {
+            return Some(info);
+        }
 
         // First check cache with exact match
         {
@@ -496,6 +544,13 @@ impl RustAnalyzer {
         if !scan_complete {
             self.scan_workspace().await;
 
+            if let Some(info) = self
+                .get_crate_qualified_type(type_path, &resolved_type)
+                .await
+            {
+                return Some(info);
+            }
+
             let cache = self.type_cache.read().await;
             return cache
                 .get(&resolved_type)
@@ -516,6 +571,18 @@ impl RustAnalyzer {
         None
     }
 
+    async fn get_crate_qualified_type(
+        &self,
+        type_path: &str,
+        resolved_type: &str,
+    ) -> Option<TypeInfo> {
+        let crate_types = self.crate_types.read().await;
+        crate_types
+            .get(resolved_type)
+            .or_else(|| crate_types.get(type_path))
+            .cloned()
+    }
+
     /// Custom Deserialize implementations and Serde conversions define their own
     /// wire format. Static field layout cannot validate that representation.
     pub async fn has_custom_deserializer(&self, type_name: &str) -> bool {
@@ -530,17 +597,21 @@ impl RustAnalyzer {
                 continue;
             }
             let aliases = self.type_aliases.read().await;
-            let target = aliases.get(&inner).or_else(|| {
-                let mut matches = aliases
-                    .iter()
-                    .filter(|(name, _)| name.ends_with(&format!("::{inner}")));
-                let (_, target) = matches.next()?;
-                if matches.next().is_none() {
-                    Some(target)
-                } else {
-                    None
-                }
-            });
+            let crate_aliases = self.crate_type_aliases.read().await;
+            let target = aliases
+                .get(&inner)
+                .or_else(|| crate_aliases.get(&inner))
+                .or_else(|| {
+                    let mut matches = aliases
+                        .iter()
+                        .filter(|(name, _)| name.ends_with(&format!("::{inner}")));
+                    let (_, target) = matches.next()?;
+                    if matches.next().is_none() {
+                        Some(target)
+                    } else {
+                        None
+                    }
+                });
             match target {
                 Some(target) => inner = target.replace(' ', ""),
                 None => break,
@@ -652,6 +723,54 @@ mod serde_attributes {
     }
 }
 
+/// Rewrite a `crate::...` path to `<crate_name>::...`.
+fn crate_qualified_path(path: &str, crate_name: &str) -> Option<String> {
+    path.strip_prefix("crate::")
+        .map(|rest| format!("{crate_name}::{rest}"))
+}
+
+/// Find the name of the crate a source file belongs to: the `[package] name` of
+/// the nearest `Cargo.toml` above it (within `root`), with `-` replaced by `_`.
+/// Results are cached per directory in `cache`.
+fn find_crate_name(
+    file_path: &Path,
+    root: &Path,
+    cache: &mut HashMap<PathBuf, Option<String>>,
+) -> Option<String> {
+    let mut visited = Vec::new();
+    let mut result = None;
+    let mut dir = file_path.parent();
+    while let Some(current) = dir {
+        if let Some(cached) = cache.get(current) {
+            result = cached.clone();
+            break;
+        }
+        visited.push(current.to_path_buf());
+        let package_name = fs::read_to_string(current.join("Cargo.toml"))
+            .ok()
+            .and_then(|text| text.parse::<toml::Table>().ok())
+            .and_then(|manifest| {
+                manifest
+                    .get("package")?
+                    .get("name")?
+                    .as_str()
+                    .map(|name| name.replace('-', "_"))
+            });
+        if package_name.is_some() {
+            result = package_name;
+            break;
+        }
+        if current == root {
+            break;
+        }
+        dir = current.parent();
+    }
+    for path in visited {
+        cache.insert(path, result.clone());
+    }
+    result
+}
+
 fn collect_custom_deserializers(items: &[Item], prefix: &str, result: &mut HashSet<String>) {
     let qualify = |name: &str| {
         if prefix.is_empty() {
@@ -725,4 +844,65 @@ fn has_serde_conversion(attrs: &[Attribute]) -> bool {
             });
             custom
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn resolves_crate_qualified_paths_in_workspace() {
+        let root =
+            std::env::temp_dir().join(format!("ron-workspace-crates-{}", std::process::id()));
+        let write = |path: &str, content: &str| {
+            let path = root.join(path);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, content).unwrap();
+        };
+        write("Cargo.toml", "[workspace]\nmembers = [\"crates/*\"]\n");
+        write(
+            "crates/proj_core/Cargo.toml",
+            "[package]\nname = \"proj-core\"\nversion = \"0.1.0\"\n",
+        );
+        write("crates/proj_core/src/lib.rs", "pub mod user;\n");
+        write(
+            "crates/proj_core/src/user.rs",
+            "pub struct User { pub id: u32, pub name: String }\npub type UserAlias = crate::user::User;\n",
+        );
+        write(
+            "crates/other/Cargo.toml",
+            "[package]\nname = \"other\"\nversion = \"0.1.0\"\n",
+        );
+        write("crates/other/src/lib.rs", "pub mod user;\n");
+        write(
+            "crates/other/src/user.rs",
+            "pub struct User { pub email: String }\n",
+        );
+
+        let analyzer = RustAnalyzer::new();
+        analyzer.set_workspace_root(&root).await;
+
+        let user = analyzer
+            .get_type_info("proj_core::user::User")
+            .await
+            .expect("proj_core::user::User should resolve");
+        assert!(user.find_field("name").is_some());
+
+        let other = analyzer
+            .get_type_info("other::user::User")
+            .await
+            .expect("other::user::User should resolve");
+        assert!(other.find_field("email").is_some());
+
+        let alias = analyzer
+            .get_type_info("proj_core::user::UserAlias")
+            .await
+            .expect("crate-qualified alias should resolve");
+        assert!(alias.find_field("id").is_some());
+
+        // Existing `crate::` paths keep working.
+        assert!(analyzer.get_type_info("crate::user::User").await.is_some());
+
+        fs::remove_dir_all(root).unwrap();
+    }
 }
