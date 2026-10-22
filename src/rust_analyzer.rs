@@ -125,7 +125,10 @@ impl RustAnalyzer {
         let mut crate_type_aliases = self.crate_type_aliases.write().await;
 
         let mut custom_deserializers = HashSet::new();
-        let mut crate_names = HashMap::new();
+        let mut crate_roots = HashMap::new();
+        // Crate-qualified types and aliases, finalized once every file is scanned
+        let mut qualified_types = HashMap::new();
+        let mut qualified_aliases = HashMap::new();
 
         // Find all .rs files in the workspace
         for entry in WalkDir::new(&root)
@@ -136,44 +139,89 @@ impl RustAnalyzer {
         {
             if let Ok(content) = fs::read_to_string(entry.path()) {
                 if let Ok(syntax_tree) = syn::parse_file(&content) {
+                    let crate_root = find_crate_root(entry.path(), &root, &mut crate_roots);
+                    // Module paths are relative to the owning crate's directory, so a
+                    // `src` directory above the crate does not leak into them.
+                    let module_prefix = crate_root
+                        .as_ref()
+                        .and_then(|(_, dir)| entry.path().strip_prefix(dir).ok())
+                        .map(|relative| self.file_path_to_module_path(relative))
+                        .unwrap_or_else(|| self.file_path_to_module_path(entry.path()));
+
+                    let mut file_deserializers = HashSet::new();
                     collect_custom_deserializers(
                         &syntax_tree.items,
-                        &self.file_path_to_module_path(entry.path()),
-                        &mut custom_deserializers,
+                        &module_prefix,
+                        &mut file_deserializers,
                     );
                     let mut file_types = HashMap::new();
                     let mut file_aliases = HashMap::new();
                     self.extract_types_from_file(
                         &syntax_tree,
                         entry.path(),
+                        &module_prefix,
                         &mut file_types,
                         &mut file_aliases,
                     );
 
                     // Also register `crate::...` paths under the owning crate's name,
                     // e.g. `crate::user::User` -> `proj_core::user::User`.
-                    if let Some(crate_name) = find_crate_name(entry.path(), &root, &mut crate_names)
-                    {
+                    if let Some((crate_name, _)) = &crate_root {
                         for (key, info) in &file_types {
-                            if let Some(qualified) = crate_qualified_path(key, &crate_name) {
-                                crate_types.insert(qualified, info.clone());
+                            if let Some(qualified) = crate_qualified_path(key, crate_name) {
+                                qualified_types
+                                    .insert(qualified, (crate_name.clone(), info.clone()));
                             }
                         }
                         for (key, target) in &file_aliases {
-                            if let Some(qualified) = crate_qualified_path(key, &crate_name) {
-                                // `type_to_string` renders paths as `crate :: a :: B`
-                                let target = target.replace(" :: ", "::");
-                                let target =
-                                    crate_qualified_path(&target, &crate_name).unwrap_or(target);
-                                crate_type_aliases.insert(qualified, target);
+                            if let Some(qualified) = crate_qualified_path(key, crate_name) {
+                                qualified_aliases
+                                    .insert(qualified, (crate_name.clone(), target.clone()));
+                            }
+                        }
+                        for name in &file_deserializers {
+                            if let Some(qualified) = crate_qualified_path(name, crate_name) {
+                                custom_deserializers.insert(qualified);
                             }
                         }
                     }
+                    custom_deserializers.extend(file_deserializers);
                     type_cache.extend(file_types);
                     type_aliases.extend(file_aliases);
                 }
             }
         }
+
+        // Resolve type references inside crate-qualified types and aliases against
+        // their owning crate, so nested lookups do not fall back to the shared
+        // `crate::` cache where same-named types from other members collide.
+        let known: HashSet<String> = qualified_types
+            .keys()
+            .chain(qualified_aliases.keys())
+            .cloned()
+            .collect();
+        for (qualified, (crate_name, mut info)) in qualified_types {
+            let module = parent_path(&qualified);
+            let qualify =
+                |ty: &mut String| *ty = qualify_type_refs(ty, &crate_name, module, &known);
+            match &mut info.kind {
+                TypeKind::Struct(fields) => {
+                    fields.iter_mut().for_each(|f| qualify(&mut f.type_name))
+                }
+                TypeKind::Enum(variants) => variants
+                    .iter_mut()
+                    .flat_map(|v| v.fields.iter_mut())
+                    .for_each(|f| qualify(&mut f.type_name)),
+            }
+            info.name = qualified.clone();
+            crate_types.insert(qualified, info);
+        }
+        for (qualified, (crate_name, target)) in qualified_aliases {
+            let target = qualify_type_refs(&target, &crate_name, parent_path(&qualified), &known);
+            // `type_to_string` renders paths as `a :: B`
+            crate_type_aliases.insert(qualified, target.replace(" :: ", "::"));
+        }
+
         *self.custom_deserializers.write().await = custom_deserializers;
     }
 
@@ -181,27 +229,24 @@ impl RustAnalyzer {
         &self,
         syntax_tree: &syn::File,
         file_path: &Path,
+        module_prefix: &str,
         type_cache: &mut HashMap<String, TypeInfo>,
         type_aliases: &mut HashMap<String, String>,
     ) {
-        // Extract module path from file path
-        let module_prefix = self.file_path_to_module_path(file_path);
-
         for item in &syntax_tree.items {
             if let Item::Struct(struct_item) = item {
                 if let Some(type_info) =
-                    self.extract_struct_info(struct_item, &module_prefix, file_path)
+                    self.extract_struct_info(struct_item, module_prefix, file_path)
                 {
                     type_cache.insert(type_info.name.clone(), type_info);
                 }
             } else if let Item::Enum(enum_item) = item {
-                if let Some(type_info) =
-                    self.extract_enum_info(enum_item, &module_prefix, file_path)
+                if let Some(type_info) = self.extract_enum_info(enum_item, module_prefix, file_path)
                 {
                     type_cache.insert(type_info.name.clone(), type_info);
                 }
             } else if let Item::Type(type_item) = item {
-                self.extract_type_alias(type_item, &module_prefix, type_aliases);
+                self.extract_type_alias(type_item, module_prefix, type_aliases);
             } else if let Item::Mod(mod_item) = item {
                 // Handle inline modules
                 if let Some((_, items)) = &mod_item.content {
@@ -729,14 +774,15 @@ fn crate_qualified_path(path: &str, crate_name: &str) -> Option<String> {
         .map(|rest| format!("{crate_name}::{rest}"))
 }
 
-/// Find the name of the crate a source file belongs to: the `[package] name` of
-/// the nearest `Cargo.toml` above it (within `root`), with `-` replaced by `_`.
-/// Results are cached per directory in `cache`.
-fn find_crate_name(
+/// Find the crate a source file belongs to: the nearest `Cargo.toml` with a
+/// `[package]` above it (within `root`). Returns the crate's path name (the
+/// `[lib] name` if set, otherwise the package name with `-` replaced by `_`)
+/// and the manifest directory. Results are cached per directory in `cache`.
+fn find_crate_root(
     file_path: &Path,
     root: &Path,
-    cache: &mut HashMap<PathBuf, Option<String>>,
-) -> Option<String> {
+    cache: &mut HashMap<PathBuf, Option<(String, PathBuf)>>,
+) -> Option<(String, PathBuf)> {
     let mut visited = Vec::new();
     let mut result = None;
     let mut dir = file_path.parent();
@@ -746,18 +792,19 @@ fn find_crate_name(
             break;
         }
         visited.push(current.to_path_buf());
-        let package_name = fs::read_to_string(current.join("Cargo.toml"))
+        let crate_name = fs::read_to_string(current.join("Cargo.toml"))
             .ok()
             .and_then(|text| text.parse::<toml::Table>().ok())
             .and_then(|manifest| {
-                manifest
-                    .get("package")?
-                    .get("name")?
-                    .as_str()
-                    .map(|name| name.replace('-', "_"))
+                let package_name = manifest.get("package")?.get("name")?.as_str()?;
+                let lib_name = manifest
+                    .get("lib")
+                    .and_then(|lib| lib.get("name"))
+                    .and_then(|name| name.as_str());
+                Some(lib_name.unwrap_or(package_name).replace('-', "_"))
             });
-        if package_name.is_some() {
-            result = package_name;
+        if let Some(name) = crate_name {
+            result = Some((name, current.to_path_buf()));
             break;
         }
         if current == root {
@@ -769,6 +816,107 @@ fn find_crate_name(
         cache.insert(path, result.clone());
     }
     result
+}
+
+/// `a::b::C` -> `a::b`
+fn parent_path(path: &str) -> &str {
+    path.rsplit_once("::").map_or("", |(parent, _)| parent)
+}
+
+/// Rewrite the paths in a rendered type (e.g. `Vec < self :: Child >`) that refer
+/// to items of the owning crate into crate-qualified paths (`my_crate::m::Child`).
+/// `module` is the crate-qualified module the type is written in; paths are only
+/// rewritten when they resolve to an entry of `known`.
+fn qualify_type_refs(ty: &str, crate_name: &str, module: &str, known: &HashSet<String>) -> String {
+    let chars: Vec<char> = ty.chars().collect();
+    let is_ident_start = |c: char| c.is_alphabetic() || c == '_';
+    let skip_spaces = |mut j: usize| {
+        while j < chars.len() && chars[j] == ' ' {
+            j += 1;
+        }
+        j
+    };
+    let mut out = String::new();
+    let mut i = 0;
+    while i < chars.len() {
+        // A lifetime is not a path
+        if chars[i] == '\'' {
+            out.push(chars[i]);
+            i += 1;
+            while i < chars.len() && (chars[i].is_alphanumeric() || chars[i] == '_') {
+                out.push(chars[i]);
+                i += 1;
+            }
+            continue;
+        }
+        if !is_ident_start(chars[i]) {
+            out.push(chars[i]);
+            i += 1;
+            continue;
+        }
+        let start = i;
+        let mut segments = Vec::new();
+        loop {
+            let segment_start = i;
+            while i < chars.len() && (chars[i].is_alphanumeric() || chars[i] == '_') {
+                i += 1;
+            }
+            segments.push(chars[segment_start..i].iter().collect::<String>());
+            let j = skip_spaces(i);
+            if j + 1 < chars.len() && chars[j] == ':' && chars[j + 1] == ':' {
+                let k = skip_spaces(j + 2);
+                if k < chars.len() && is_ident_start(chars[k]) {
+                    i = k;
+                    continue;
+                }
+            }
+            break;
+        }
+        match resolve_in_crate(&segments, crate_name, module, known) {
+            Some(qualified) => out.push_str(&qualified),
+            None => out.extend(&chars[start..i]),
+        }
+    }
+    out
+}
+
+/// Resolve a path written in `module` of `crate_name` to a crate-qualified path
+/// in `known`.
+fn resolve_in_crate(
+    segments: &[String],
+    crate_name: &str,
+    module: &str,
+    known: &HashSet<String>,
+) -> Option<String> {
+    let mut base: Vec<&str> = module.split("::").collect();
+    let mut rest = segments;
+    match segments.first()?.as_str() {
+        "crate" => {
+            base = vec![crate_name];
+            rest = &segments[1..];
+        }
+        "self" => rest = &segments[1..],
+        "super" => {
+            while rest.first().is_some_and(|s| s == "super") {
+                if base.len() <= 1 {
+                    return None;
+                }
+                base.pop();
+                rest = &rest[1..];
+            }
+        }
+        _ => {}
+    }
+    if rest.is_empty() {
+        return None;
+    }
+    let candidate = base
+        .into_iter()
+        .map(str::to_string)
+        .chain(rest.iter().cloned())
+        .collect::<Vec<_>>()
+        .join("::");
+    known.contains(&candidate).then_some(candidate)
 }
 
 fn collect_custom_deserializers(items: &[Item], prefix: &str, result: &mut HashSet<String>) {
@@ -902,6 +1050,134 @@ mod tests {
 
         // Existing `crate::` paths keep working.
         assert!(analyzer.get_type_info("crate::user::User").await.is_some());
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    fn write_tree(root: &Path, files: &[(&str, &str)]) {
+        for (path, content) in files {
+            let path = root.join(path);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, content).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn crate_module_paths_ignore_src_above_the_crate() {
+        let base = std::env::temp_dir().join(format!("ron-src-ancestor-{}", std::process::id()));
+        // The workspace itself lives under a directory named `src`.
+        let root = base.join("src").join("ws");
+        write_tree(
+            &root,
+            &[
+                ("Cargo.toml", "[workspace]\nmembers = [\"crates/*\"]\n"),
+                (
+                    "crates/app/Cargo.toml",
+                    "[package]\nname = \"app\"\nversion = \"0.1.0\"\n",
+                ),
+                ("crates/app/src/lib.rs", "pub mod user;\n"),
+                ("crates/app/src/user.rs", "pub struct User { pub id: u32 }\n"),
+                (
+                    "crates/schema/Cargo.toml",
+                    "[package]\nname = \"schema-package\"\nversion = \"0.1.0\"\n\n[lib]\nname = \"schema\"\n",
+                ),
+                ("crates/schema/src/lib.rs", "pub struct Config { pub level: u8 }\n"),
+            ],
+        );
+
+        let analyzer = RustAnalyzer::new();
+        analyzer.set_workspace_root(&root).await;
+
+        let user = analyzer
+            .get_type_info("app::user::User")
+            .await
+            .expect("app::user::User should resolve");
+        assert!(user.find_field("id").is_some());
+        assert!(analyzer.get_type_info("crate::user::User").await.is_some());
+
+        // `[lib] name` is the path used in Rust code.
+        let config = analyzer
+            .get_type_info("schema::Config")
+            .await
+            .expect("schema::Config should resolve via the lib target name");
+        assert!(config.find_field("level").is_some());
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[tokio::test]
+    async fn crate_qualified_types_keep_their_crate_for_nested_lookups() {
+        let root = std::env::temp_dir().join(format!("ron-crate-identity-{}", std::process::id()));
+        let user_rs = |child_field: &str, extra: &str| {
+            format!(
+                "pub struct User {{ pub child: Child, pub children: Vec<self::Child> }}\n\
+                 pub struct Child {{ pub {child_field}: u32 }}\n\
+                 pub type Alias = User;\n\
+                 pub type SelfAlias = self::User;\n\
+                 pub mod nested {{ pub type SuperAlias = super::User; }}\n{extra}"
+            )
+        };
+        let a_user = user_rs("a_only", "");
+        let b_user = user_rs(
+            "b_only",
+            "impl<'de> serde::Deserialize<'de> for User { fn deserialize<D>(_: D) -> Result<Self, D::Error> where D: serde::Deserializer<'de> { todo!() } }\n",
+        );
+        write_tree(
+            &root,
+            &[
+                ("Cargo.toml", "[workspace]\nmembers = [\"a\", \"b\"]\n"),
+                (
+                    "a/Cargo.toml",
+                    "[package]\nname = \"a\"\nversion = \"0.1.0\"\n",
+                ),
+                ("a/src/lib.rs", "pub mod user;\n"),
+                ("a/src/user.rs", &a_user),
+                (
+                    "b/Cargo.toml",
+                    "[package]\nname = \"b\"\nversion = \"0.1.0\"\n",
+                ),
+                ("b/src/lib.rs", "pub mod user;\n"),
+                ("b/src/user.rs", &b_user),
+            ],
+        );
+
+        let analyzer = RustAnalyzer::new();
+        analyzer.set_workspace_root(&root).await;
+
+        for krate in ["a", "b"] {
+            let own = format!("{krate}_only");
+            let user = analyzer
+                .get_type_info(&format!("{krate}::user::User"))
+                .await
+                .unwrap();
+            assert_eq!(user.name, format!("{krate}::user::User"));
+
+            // Nested field types resolve within the owning crate.
+            let child_type = &user.find_field("child").unwrap().type_name;
+            let child = analyzer.get_type_info(child_type).await.unwrap();
+            assert!(child.find_field(&own).is_some(), "{krate}: {child_type}");
+            let children_type = user
+                .find_field("children")
+                .unwrap()
+                .type_name
+                .replace(' ', "");
+            assert_eq!(children_type, format!("Vec<{krate}::user::Child>"));
+
+            // Relative aliases resolve within the owning crate and module.
+            for alias in ["Alias", "SelfAlias", "nested::SuperAlias"] {
+                let info = analyzer
+                    .get_type_info(&format!("{krate}::user::{alias}"))
+                    .await
+                    .unwrap_or_else(|| panic!("{krate}::user::{alias} should resolve"));
+                assert_eq!(info.name, format!("{krate}::user::User"), "{alias}");
+            }
+        }
+
+        // Only `b`'s User has a custom Deserialize impl.
+        assert!(analyzer.has_custom_deserializer("b::user::User").await);
+        assert!(analyzer.has_custom_deserializer("b::user::Alias").await);
+        assert!(!analyzer.has_custom_deserializer("a::user::User").await);
+        assert!(!analyzer.has_custom_deserializer("a::user::Alias").await);
 
         fs::remove_dir_all(root).unwrap();
     }
